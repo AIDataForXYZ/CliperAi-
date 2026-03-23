@@ -13,6 +13,7 @@ class JobStep(str, Enum):
     GENERATE_CLIPS = "generate_clips"
     EXPORT_CLIPS = "export_clips"
     EXPORT_SHORTS = "export_shorts"
+    GENERATE_CAPTIONS = "generate_captions"
 
 
 class JobState(str, Enum):

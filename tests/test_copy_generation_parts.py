@@ -19,6 +19,8 @@ import json
 from pathlib import Path
 from dotenv import load_dotenv
 
+import pytest
+
 # Cargar variables de entorno
 load_dotenv()
 
@@ -28,6 +30,27 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from langchain_google_genai import ChatGoogleGenerativeAI
 from src.prompts import get_prompt_for_style
 from src.prompts.classifier_prompt import get_classifier_prompt
+
+
+@pytest.fixture(scope="module")
+def clips_data():
+    """Load clips from temp/ — skip if fixture data not available."""
+    temp_dir = Path("temp")
+    clips_files = list(temp_dir.glob("*_clips.json")) if temp_dir.exists() else []
+    if not clips_files:
+        pytest.skip("No *_clips.json found in temp/ — integration data not available")
+    with open(clips_files[0], "r", encoding="utf-8") as f:
+        clips_metadata = json.load(f)
+    return [
+        {
+            "clip_id": clip["clip_id"],
+            "start_time": clip["start_time"],
+            "end_time": clip["end_time"],
+            "duration": clip["duration"],
+            "transcript": clip["full_text"],
+        }
+        for clip in clips_metadata["clips"]
+    ]
 
 
 def test_1_load_clips():

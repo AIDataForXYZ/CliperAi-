@@ -18,10 +18,13 @@ Test Cases:
 """
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -136,6 +139,7 @@ def create_test_transcript(output_path: Path):
     return output_path
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires ffmpeg")
 def test_logo_only():
     """
     Test Case 1: Solo logo (sin subtítulos)
@@ -187,6 +191,7 @@ def test_logo_only():
             return False
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires ffmpeg")
 def test_subtitles_only():
     """
     Test Case 2: Solo subtítulos (sin logo)
@@ -237,6 +242,7 @@ def test_subtitles_only():
             return False
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="requires ffmpeg")
 def test_logo_and_subtitles():
     """
     Test Case 3: Logo + Subtítulos (CRITICAL TEST)

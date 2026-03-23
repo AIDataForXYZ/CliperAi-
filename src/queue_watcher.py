@@ -245,10 +245,16 @@ def process_job(db_path: str, item: dict, clips_dir: str):
         update_queue_status(db_path, item_id, "failed", error="No clips exported")
         return
 
-    # Generate captions
+    # Generate captions (GENERATE_CAPTIONS step)
     captions = {}
+    logger.info(f"[{JobStep.GENERATE_CAPTIONS.value}] Generating captions for {len(exported_paths)} clip(s)")
     if transcript_path and os.path.exists(transcript_path):
-        captions = generate_captions_for_clips(clips_data, transcript_path)
+        try:
+            captions = generate_captions_for_clips(clips_data, transcript_path)
+        except Exception as e:
+            logger.error(f"Caption generation failed for #{item_id}: {e} — using fallback labels")
+    else:
+        logger.warning(f"No transcript found for #{item_id}, clips will have auto-labelled captions")
 
     # Insert each clip into the queue as 'review'
     for i, clip_path in enumerate(exported_paths):
@@ -278,7 +284,16 @@ def run_once(db_path: str, clips_dir: str) -> int:
 
     logger.info(f"Found {len(jobs)} processing job(s)")
     for job in jobs:
-        process_job(db_path, job, clips_dir)
+        try:
+            process_job(db_path, job, clips_dir)
+        except Exception as exc:
+            item_id = job.get("id")
+            logger.error(f"Unhandled error processing job #{item_id}: {exc}")
+            if item_id:
+                try:
+                    update_queue_status(db_path, item_id, "failed", error=f"Unhandled error: {exc}")
+                except Exception:
+                    pass
 
     return len(jobs)
 

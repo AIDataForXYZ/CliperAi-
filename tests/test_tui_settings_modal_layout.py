@@ -59,7 +59,7 @@ def test_settings_modal_layout_common_sizes(tmp_path: Path, monkeypatch) -> None
             from textual.widgets import Input, Static
 
             await _dismiss_dependency_modal_if_present(pilot, app)
-            await pilot.press("s")
+            await app.action_settings()
 
             def has_logo_input() -> bool:
                 try:
@@ -83,8 +83,7 @@ def test_settings_modal_layout_common_sizes(tmp_path: Path, monkeypatch) -> None
             def has_error() -> bool:
                 try:
                     err = app.screen.query_one("#setting_logo_path_error", Static)
-                    renderable = getattr(err, "renderable", getattr(err, "_renderable", ""))
-                    return bool(err.display) and bool(str(renderable).strip())
+                    return bool(err.display) and bool(err.content.strip())
                 except Exception:
                     return False
 

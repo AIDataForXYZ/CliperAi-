@@ -10,7 +10,18 @@ T = TypeVar("T")
 def _validate_type(value: Any, expected_type: Type[T]) -> T:
     """
     Small compatibility wrapper for pydantic v1/v2 typed validation.
+
+    Applies explicit coercions for str/bool before delegating to pydantic so
+    that behaviour is consistent across pydantic v1 and v2:
+      - str:  None → "", int/float → str(value)
+      - bool: None → False
     """
+    # Pre-process simple types that Pydantic v2 won't coerce automatically
+    if expected_type is str:
+        return ("" if value is None else str(value))  # type: ignore[return-value]
+    if expected_type is bool and value is None:
+        return False  # type: ignore[return-value]
+
     try:
         from pydantic import TypeAdapter  # type: ignore
     except (ModuleNotFoundError, ImportError):

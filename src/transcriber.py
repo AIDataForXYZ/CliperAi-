@@ -169,7 +169,7 @@ class Transcriber:
         # Si ya existe transcripción y skip_if_exists=True, la retorno
         if skip_if_exists and transcript_path.exists():
             self.logger.info(f"Transcripción ya existe: {transcript_path}")
-            return str(transcript_path)
+            return str(transcript_path.resolve())
 
         try:
             # PASO 1: Extraer audio

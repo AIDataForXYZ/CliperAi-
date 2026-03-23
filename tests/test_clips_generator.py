@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+clipsai = pytest.importorskip("clipsai", reason="clipsai not importable (missing system lib, e.g. libGL)")
 from src.clips_generator import ClipsGenerator, generate_clips_from_transcript
 
 

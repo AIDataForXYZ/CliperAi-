@@ -91,7 +91,7 @@ def test_tui_video_features_single_video(tmp_path: Path, monkeypatch) -> None:
         video_id = fixture_path.stem
 
         class FakeJobRunner:
-            def __init__(self, state_manager, emit):
+            def __init__(self, state_manager, emit, *, cli_output_dir=None):
                 self.state_manager = state_manager
                 self.emit = emit
 
@@ -353,7 +353,7 @@ def test_tui_shift_p_logo_selection(tmp_path: Path, monkeypatch) -> None:
         import src.tui.app as tui_app_module
 
         class FakeJobRunner:
-            def __init__(self, state_manager, emit):
+            def __init__(self, state_manager, emit, *, cli_output_dir=None):
                 self.state_manager = state_manager
                 self.emit = emit
 

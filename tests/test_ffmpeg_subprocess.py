@@ -5,7 +5,8 @@ Propósito: Validar que FFmpeg subprocess resuelve el problema de VideoWriter
 """
 
 from pathlib import Path
-from src.reframer import FaceReframer
+
+import pytest
 from loguru import logger
 
 # Setup
@@ -13,8 +14,9 @@ video_path = Path("downloads/Storycraft in the Age of AI, Danny Headspace - AI C
 output_path = Path("tests/test_ffmpeg_output.mp4")
 
 if not video_path.exists():
-    print(f"ERROR: Video no encontrado en {video_path}")
-    exit(1)
+    pytest.skip(f"Video fixture not found: {video_path}", allow_module_level=True)
+
+from src.reframer import FaceReframer
 
 # Crear directorio si no existe
 output_path.parent.mkdir(exist_ok=True)
