@@ -261,6 +261,8 @@ class VideoExporter:
         ffmpeg_threads: int = 0,
         subtitle_max_chars_per_line: int = 42,
         subtitle_max_duration: float = 5.0,
+        grouping_preset: str = "smart",
+        pause_threshold: Optional[float] = None,
         flat_output: bool = False,
         # Speech-aware trimming: maximum silence buffer at start/end (milliseconds)
         trim_ms_start: int = 0,
@@ -358,6 +360,8 @@ class VideoExporter:
                 output_path=str(temp_srt_path),
                 max_chars_per_line=subtitle_max_chars_per_line,
                 max_duration=subtitle_max_duration,
+                grouping_preset=grouping_preset,
+                pause_threshold=pause_threshold,
             )
             if generated and temp_srt_path.exists():
                 srt_file = temp_srt_path

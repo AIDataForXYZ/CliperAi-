@@ -6,6 +6,7 @@ Este módulo toma la transcripción con timestamps y la convierte a formato SRT.
 Los subtítulos pueden quemarse en el video (hard-coded) o agregarse como pista (soft-coded).
 """
 
+import re
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -22,22 +23,73 @@ class SubtitleGenerator:
 
     Características:
     - Formato SRT estándar (compatible con todos los players)
-    - Agrupación inteligente de palabras (max 42 caracteres por línea)
+    - Agrupación inteligente de palabras con múltiples presets
     - Sincronización perfecta con timestamps de WhisperX
     - Soporte para múltiples idiomas
+
+    Presets de agrupación:
+    - smart: Usa todas las señales (pausas, oraciones, cláusulas, conjunciones)
+    - punctuation: Solo corta en puntuación (oraciones y comas)
+    - pauses: Solo corta en pausas del habla
+    - fixed: Comportamiento original, solo por conteo de caracteres y duración
     """
+
+    # Presets de agrupación con sus parámetros
+    GROUPING_PRESETS: Dict[str, Dict] = {
+        "smart": {
+            "description": "Intelligent splitting using pauses, punctuation, and clauses",
+            "split_on_pause": True,
+            "split_on_sentence_end": True,
+            "split_on_clause_end": True,
+            "split_on_clause_start": True,
+            "pause_threshold": 0.7,
+        },
+        "punctuation": {
+            "description": "Split only on punctuation marks (periods, commas, etc.)",
+            "split_on_pause": False,
+            "split_on_sentence_end": True,
+            "split_on_clause_end": True,
+            "split_on_clause_start": False,
+            "pause_threshold": 0.7,
+        },
+        "pauses": {
+            "description": "Split only on speech pauses (silence gaps)",
+            "split_on_pause": True,
+            "split_on_sentence_end": False,
+            "split_on_clause_end": False,
+            "split_on_clause_start": False,
+            "pause_threshold": 0.7,
+        },
+        "fixed": {
+            "description": "Simple character count and duration limits (no smart splitting)",
+            "split_on_pause": False,
+            "split_on_sentence_end": False,
+            "split_on_clause_end": False,
+            "split_on_clause_start": False,
+            "pause_threshold": 0.7,
+        },
+    }
 
     def __init__(self):
         self.console = Console()
         self.logger = logger
 
+    @classmethod
+    def get_grouping_presets(cls) -> Dict[str, Dict]:
+        """Retorno los presets de agrupación disponibles con sus descripciones."""
+        return {
+            name: {"description": preset["description"], **preset}
+            for name, preset in cls.GROUPING_PRESETS.items()
+        }
 
     def generate_srt_from_transcript(
         self,
         transcript_path: str,
         output_path: Optional[str] = None,
         max_chars_per_line: int = 42,
-        max_duration: float = 5.0
+        max_duration: float = 5.0,
+        grouping_preset: str = "smart",
+        pause_threshold: Optional[float] = None,
     ) -> Optional[str]:
         """
         Genero archivo SRT desde transcripción de WhisperX
@@ -47,6 +99,8 @@ class SubtitleGenerator:
             output_path: Ruta de salida para el SRT (opcional)
             max_chars_per_line: Máximo de caracteres por línea de subtítulo
             max_duration: Duración máxima de un subtítulo en segundos
+            grouping_preset: Preset de agrupación (smart, punctuation, pauses, fixed)
+            pause_threshold: Umbral de pausa en segundos (sobrescribe el del preset)
 
         Returns:
             Ruta al archivo SRT generado, o None si falla
@@ -71,7 +125,9 @@ class SubtitleGenerator:
             srt_entries = self._create_srt_entries(
                 segments,
                 max_chars_per_line=max_chars_per_line,
-                max_duration=max_duration
+                max_duration=max_duration,
+                grouping_preset=grouping_preset,
+                pause_threshold=pause_threshold,
             )
 
             # Escribo el archivo SRT
@@ -93,7 +149,9 @@ class SubtitleGenerator:
         clip_end: float,
         output_path: str,
         max_chars_per_line: int = 42,
-        max_duration: float = 5.0
+        max_duration: float = 5.0,
+        grouping_preset: str = "smart",
+        pause_threshold: Optional[float] = None,
     ) -> Optional[str]:
         """
         Genero archivo SRT para un clip específico
@@ -157,7 +215,9 @@ class SubtitleGenerator:
             srt_entries = self._create_srt_entries(
                 clip_segments,
                 max_chars_per_line=max_chars_per_line,
-                max_duration=max_duration
+                max_duration=max_duration,
+                grouping_preset=grouping_preset,
+                pause_threshold=pause_threshold,
             )
 
             # Escribo el archivo SRT
@@ -172,14 +232,44 @@ class SubtitleGenerator:
             return None
 
 
+    # Palabras que inician cláusulas — preferimos cortar ANTES de ellas
+    _CLAUSE_STARTERS = frozenset({
+        'and', 'but', 'or', 'so', 'because', 'since', 'while', 'when',
+        'where', 'which', 'that', 'then', 'if', 'although', 'though',
+        'however', 'also', 'plus', 'yet', 'nor',
+        # Spanish
+        'y', 'pero', 'o', 'porque', 'cuando', 'donde', 'que', 'entonces',
+        'si', 'aunque', 'también', 'ni', 'sino',
+    })
+
+    # Puntuación que marca fin de oración — corte obligatorio después
+    _SENTENCE_END_RE = re.compile(r'[.!?]$')
+
+    # Puntuación que marca pausa de cláusula — corte preferido después
+    _CLAUSE_END_RE = re.compile(r'[,;:\u2014—\-]$')
+
+    # Umbral de pausa entre palabras para forzar corte (segundos)
+    _PAUSE_THRESHOLD = 0.7
+
+    # Mínimo de palabras antes de permitir un corte por puntuación/pausa
+    _MIN_WORDS_PER_LINE = 2
+
     def _create_srt_entries(
         self,
         segments: List[Dict],
         max_chars_per_line: int = 42,
-        max_duration: float = 5.0
+        max_duration: float = 5.0,
+        grouping_preset: str = "smart",
+        pause_threshold: Optional[float] = None,
     ) -> List[str]:
         """
-        Creo las entradas en formato SRT desde segmentos
+        Creo las entradas en formato SRT desde segmentos con agrupación inteligente.
+
+        Usa múltiples señales para decidir dónde cortar (según el preset):
+        1. Pausas en el habla (gap > pause_threshold entre palabras)
+        2. Fin de oración (. ! ?)
+        3. Fin de cláusula (, ; :) y conjunciones (but, and, so...)
+        4. Límites duros de caracteres y duración como respaldo
 
         Formato SRT:
         1
@@ -190,6 +280,14 @@ class SubtitleGenerator:
         00:00:03,500 --> 00:00:07,000
         This is the second subtitle line
         """
+        # Resuelvo configuración del preset
+        preset = self.GROUPING_PRESETS.get(grouping_preset, self.GROUPING_PRESETS["smart"])
+        split_on_pause = preset["split_on_pause"]
+        split_on_sentence = preset["split_on_sentence_end"]
+        split_on_clause = preset["split_on_clause_end"]
+        split_on_clause_start = preset["split_on_clause_start"]
+        effective_pause = pause_threshold if pause_threshold is not None else preset["pause_threshold"]
+
         srt_entries = []
         subtitle_index = 1
 
@@ -198,44 +296,72 @@ class SubtitleGenerator:
             if 'words' in segment and segment['words']:
                 words = segment['words']
 
-                # Agrupo palabras en líneas de subtítulos
+                # Filtro palabras vacías y preparo lista limpia
+                clean_words = []
+                for w in words:
+                    text = w.get('word', '').strip()
+                    if text:
+                        clean_words.append(w)
+
+                if not clean_words:
+                    continue
+
+                # Agrupo palabras inteligentemente
                 current_line_words = []
                 current_line_chars = 0
                 line_start_time = None
 
-                for word_obj in words:
+                def _flush_line():
+                    nonlocal current_line_words, current_line_chars, line_start_time
+                    nonlocal subtitle_index
+                    if not current_line_words:
+                        return
+                    line_text = ' '.join(
+                        w.get('word', '').strip() for w in current_line_words
+                    )
+                    line_end_time = current_line_words[-1].get('end', line_start_time + 1.0)
+                    srt_entry = self._format_srt_entry(
+                        subtitle_index, line_start_time, line_end_time, line_text
+                    )
+                    srt_entries.append(srt_entry)
+                    subtitle_index += 1
+                    current_line_words = []
+                    current_line_chars = 0
+                    line_start_time = None
+
+                for i, word_obj in enumerate(clean_words):
                     word_text = word_obj.get('word', '').strip()
                     word_start = word_obj.get('start', 0)
                     word_end = word_obj.get('end', 0)
-
-                    if not word_text:
-                        continue
 
                     # Inicio de nueva línea
                     if line_start_time is None:
                         line_start_time = word_start
 
-                    # Verifico si agregar esta palabra excede el límite
                     word_length = len(word_text) + 1  # +1 por el espacio
 
-                    if (current_line_chars + word_length > max_chars_per_line or
-                        (line_start_time and word_end - line_start_time > max_duration)):
+                    # --- Detección de pausa entre esta palabra y la anterior ---
+                    has_pause = False
+                    if split_on_pause and current_line_words:
+                        prev_end = current_line_words[-1].get('end', 0)
+                        gap = word_start - prev_end
+                        has_pause = gap >= effective_pause
 
-                        # Creo entrada SRT con las palabras actuales
-                        if current_line_words:
-                            line_text = ' '.join([w.get('word', '').strip() for w in current_line_words])
-                            line_end_time = current_line_words[-1].get('end', word_start)
+                    # --- Verifico límites duros ---
+                    exceeds_chars = current_line_chars + word_length > max_chars_per_line
+                    exceeds_duration = (
+                        line_start_time is not None
+                        and word_end - line_start_time > max_duration
+                    )
 
-                            srt_entry = self._format_srt_entry(
-                                subtitle_index,
-                                line_start_time,
-                                line_end_time,
-                                line_text
-                            )
-                            srt_entries.append(srt_entry)
-                            subtitle_index += 1
+                    # --- Pausa larga fuerza corte ---
+                    pause_forces_break = (
+                        has_pause
+                        and len(current_line_words) >= self._MIN_WORDS_PER_LINE
+                    )
 
-                        # Inicio nueva línea
+                    if exceeds_chars or exceeds_duration or pause_forces_break:
+                        _flush_line()
                         current_line_words = [word_obj]
                         current_line_chars = word_length
                         line_start_time = word_start
@@ -244,19 +370,30 @@ class SubtitleGenerator:
                         current_line_words.append(word_obj)
                         current_line_chars += word_length
 
-                # Proceso última línea si quedó algo
-                if current_line_words:
-                    line_text = ' '.join([w.get('word', '').strip() for w in current_line_words])
-                    line_end_time = current_line_words[-1].get('end', line_start_time + 1.0)
+                        # --- Corte proactivo en límites naturales ---
+                        if len(current_line_words) >= self._MIN_WORDS_PER_LINE:
+                            should_flush = False
 
-                    srt_entry = self._format_srt_entry(
-                        subtitle_index,
-                        line_start_time,
-                        line_end_time,
-                        line_text
-                    )
-                    srt_entries.append(srt_entry)
-                    subtitle_index += 1
+                            # Fin de oración: corte inmediato
+                            if split_on_sentence and self._SENTENCE_END_RE.search(word_text):
+                                should_flush = True
+
+                            # Fin de cláusula (coma, punto y coma, etc.)
+                            elif split_on_clause and self._CLAUSE_END_RE.search(word_text):
+                                should_flush = True
+
+                            # La siguiente palabra es un inicio de cláusula
+                            elif split_on_clause_start and (i + 1 < len(clean_words)):
+                                next_word = clean_words[i + 1].get('word', '').strip().lower()
+                                next_clean = re.sub(r'[^\w]', '', next_word)
+                                if next_clean in self._CLAUSE_STARTERS:
+                                    should_flush = True
+
+                            if should_flush:
+                                _flush_line()
+
+                # Proceso última línea si quedó algo
+                _flush_line()
 
             else:
                 # Fallback: uso el texto completo del segmento
