@@ -12,13 +12,15 @@ Usage:
 import argparse
 import json
 import os
-import sqlite3
 import sys
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
+
+import psycopg2
+import psycopg2.extras
 
 from src.core.events import JobStatusEvent, LogEvent, LogLevel, ProgressEvent
 from src.core.job_runner import JobRunner
@@ -36,13 +38,12 @@ DEFAULT_CLIPS_DIR = os.getenv(
 IDLE_TIMEOUT_SECONDS = int(os.getenv("CLIPER_IDLE_TIMEOUT", "600"))  # 10 min
 
 
-# --- SQLite queue operations (reads from shorts-analytics DB) ---
+# --- PostgreSQL queue operations (shared DB with shorts-analytics) ---
 
 @contextmanager
-def get_queue_db(db_path: str):
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+def get_queue_db(db_url: str):
+    conn = psycopg2.connect(db_url)
+    conn.autocommit = False
     try:
         yield conn
         conn.commit()
@@ -50,39 +51,42 @@ def get_queue_db(db_path: str):
         conn.close()
 
 
-def get_processing_jobs(db_path: str) -> list[dict]:
-    with get_queue_db(db_path) as conn:
-        rows = conn.execute(
-            "SELECT * FROM queue WHERE status = 'processing' ORDER BY uploaded_at ASC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+def get_processing_jobs(db_url: str) -> list[dict]:
+    with get_queue_db(db_url) as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM queue WHERE status = 'processing' ORDER BY uploaded_at ASC"
+            )
+            return [dict(r) for r in cur.fetchall()]
 
 
-def update_queue_status(db_path: str, item_id: int, status: str, **extra):
-    with get_queue_db(db_path) as conn:
-        sets = ["status = ?"]
-        vals = [status]
-        for k, v in extra.items():
-            sets.append(f"{k} = ?")
-            vals.append(v)
-        vals.append(item_id)
-        conn.execute(f"UPDATE queue SET {', '.join(sets)} WHERE id = ?", vals)
+def update_queue_status(db_url: str, item_id: int, status: str, **extra):
+    with get_queue_db(db_url) as conn:
+        with conn.cursor() as cur:
+            sets = ["status = %s"]
+            vals = [status]
+            for k, v in extra.items():
+                sets.append(f"{k} = %s")
+                vals.append(v)
+            vals.append(item_id)
+            cur.execute(f"UPDATE queue SET {', '.join(sets)} WHERE id = %s", vals)
 
 
 def add_clip_to_queue(
-    db_path: str,
+    db_url: str,
     parent_id: int,
     clip_path: str,
     caption: str,
     metadata: dict,
     platforms: str,
 ) -> int:
-    with get_queue_db(db_path) as conn:
-        cur = conn.execute(
-            "INSERT INTO queue (status, clip_path, caption, clip_metadata, parent_id, platforms) VALUES (?, ?, ?, ?, ?, ?)",
-            ("review", clip_path, caption, json.dumps(metadata), parent_id, platforms),
-        )
-        return cur.lastrowid
+    with get_queue_db(db_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO queue (status, clip_path, caption, clip_metadata, parent_id, platforms) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                ("review", clip_path, caption, json.dumps(metadata), parent_id, platforms),
+            )
+            return cur.fetchone()[0]
 
 
 # --- Event handler ---
@@ -169,17 +173,28 @@ def generate_captions_for_clips(clips: list[dict], transcript_path: str) -> dict
 
 # --- Main process ---
 
-def process_job(db_path: str, item: dict, clips_dir: str):
+def _is_short_enhance(item: dict) -> tuple[bool, dict]:
+    """Check if this item is a short needing enhancement. Returns (is_short, enhance_opts)."""
+    meta_raw = item.get("clip_metadata") or "{}"
+    try:
+        meta = json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+    except (json.JSONDecodeError, TypeError):
+        meta = {}
+    return bool(meta.get("enhance_short")), meta
+
+
+def process_job(db_url: str, item: dict, clips_dir: str):
     """Process a single queue item through CliperAi's pipeline."""
     item_id = item["id"]
     source_video = item["source_video"]
     platforms = item.get("platforms", "[]")
 
     if not source_video or not os.path.exists(source_video):
-        update_queue_status(db_path, item_id, "failed", error=f"Source video not found: {source_video}")
+        update_queue_status(db_url, item_id, "failed", error=f"Source video not found: {source_video}")
         return
 
-    logger.info(f"Processing #{item_id}: {source_video}")
+    is_short, enhance_opts = _is_short_enhance(item)
+    logger.info(f"Processing #{item_id}: {source_video}" + (" [short enhance]" if is_short else ""))
 
     # Setup CliperAi state manager in a temp directory for this job
     work_dir = Path(clips_dir) / f".work_{item_id}"
@@ -198,21 +213,51 @@ def process_job(db_path: str, item: dict, clips_dir: str):
         video_path=str(Path(source_video).resolve()),
     )
 
-    # Create job spec
+    # Create job spec — shorts use EXPORT_SHORTS, long-form uses full pipeline
     job_id = f"queue_{item_id}_{uuid.uuid4().hex[:8]}"
-    job = JobSpec(
-        job_id=job_id,
-        video_ids=[video_id],
-        steps=[JobStep.TRANSCRIBE, JobStep.GENERATE_CLIPS, JobStep.EXPORT_CLIPS],
-        settings={
-            "transcribe": {"device": "auto", "model": "base"},
-            "clips": {},
-            "export": {
-                "aspect_ratio": "9:16",
-                "add_subtitles": True,
+
+    if is_short:
+        # Build shorts-specific settings from enhance options stored in clip_metadata
+        shorts_settings: dict = {
+            "add_logo": bool(enhance_opts.get("add_logo", False)),
+            "skip_done": False,
+            "add_subtitles": bool(enhance_opts.get("add_subtitles", False)),
+        }
+        if enhance_opts.get("logo_position"):
+            shorts_settings["logo_position"] = enhance_opts["logo_position"]
+        if enhance_opts.get("logo_scale"):
+            shorts_settings["logo_scale"] = float(enhance_opts["logo_scale"])
+        if enhance_opts.get("subtitle_preset"):
+            shorts_settings["subtitle_style"] = enhance_opts["subtitle_preset"]
+        if enhance_opts.get("trim_silence"):
+            shorts_settings["trim_ms_start"] = int(enhance_opts.get("trim_ms_start", 1000))
+            shorts_settings["trim_ms_end"] = int(enhance_opts.get("trim_ms_end", 1000))
+        if enhance_opts.get("video_crf"):
+            shorts_settings["video_crf"] = int(enhance_opts["video_crf"])
+
+        job = JobSpec(
+            job_id=job_id,
+            video_ids=[video_id],
+            steps=[JobStep.TRANSCRIBE, JobStep.EXPORT_SHORTS],
+            settings={
+                "transcribe": {"device": "auto", "model": "base"},
+                "shorts": shorts_settings,
             },
-        },
-    )
+        )
+    else:
+        job = JobSpec(
+            job_id=job_id,
+            video_ids=[video_id],
+            steps=[JobStep.TRANSCRIBE, JobStep.GENERATE_CLIPS, JobStep.EXPORT_CLIPS],
+            settings={
+                "transcribe": {"device": "auto", "model": "base"},
+                "clips": {},
+                "export": {
+                    "aspect_ratio": "9:16",
+                    "add_subtitles": True,
+                },
+            },
+        )
 
     # Run pipeline
     handler = QueueEventHandler()
@@ -221,77 +266,96 @@ def process_job(db_path: str, item: dict, clips_dir: str):
     try:
         status = runner.run_job(job)
     except Exception as e:
-        update_queue_status(db_path, item_id, "failed", error=str(e))
+        update_queue_status(db_url, item_id, "failed", error=str(e))
         logger.error(f"Job failed for #{item_id}: {e}")
         return
 
     if status.state == JobState.FAILED:
-        update_queue_status(db_path, item_id, "failed", error=status.error or "Unknown error")
+        update_queue_status(db_url, item_id, "failed", error=status.error or "Unknown error")
         logger.error(f"Job failed for #{item_id}: {status.error}")
         return
 
-    # Collect exported clips
+    # Collect results
     video_state = state_manager.get_video_state(video_id) or {}
-    exported_paths = video_state.get("exported_clips", [])
-    clips_data = video_state.get("clips", [])
-    transcript_path = video_state.get("transcript_path") or video_state.get("transcription_path", "")
 
-    if not exported_paths:
-        # Try to find clips in the exports dir
-        exports_dir = Path(clips_dir)
-        exported_paths = sorted(str(p) for p in exports_dir.glob(f"*{video_id}*.mp4"))
+    if is_short:
+        # Short enhance: single enhanced video replaces the original
+        enhanced_path = video_state.get("shorts_export_path")
+        if not enhanced_path:
+            # Fallback: look for the export in clips_dir
+            exports_dir = Path(clips_dir)
+            candidates = sorted(str(p) for p in exports_dir.glob(f"*{video_id}*_short.mp4"))
+            enhanced_path = candidates[0] if candidates else None
 
-    if not exported_paths:
-        update_queue_status(db_path, item_id, "failed", error="No clips exported")
-        return
+        if not enhanced_path:
+            update_queue_status(db_url, item_id, "failed", error="Short enhancement produced no output")
+            return
 
-    # Generate captions (GENERATE_CAPTIONS step)
-    captions = {}
-    logger.info(f"[{JobStep.GENERATE_CAPTIONS.value}] Generating captions for {len(exported_paths)} clip(s)")
-    if transcript_path and os.path.exists(transcript_path):
-        try:
-            captions = generate_captions_for_clips(clips_data, transcript_path)
-        except Exception as e:
-            logger.error(f"Caption generation failed for #{item_id}: {e} — using fallback labels")
+        # Update the original item directly: set clip_path to enhanced video, move to review
+        update_queue_status(db_url, item_id, "review", clip_path=enhanced_path)
+        logger.info(f"Finished #{item_id}: short enhanced → review ({Path(enhanced_path).name})")
     else:
-        logger.warning(f"No transcript found for #{item_id}, clips will have auto-labelled captions")
+        # Long-form: multiple clips
+        exported_paths = video_state.get("exported_clips", [])
+        clips_data = video_state.get("clips", [])
+        transcript_path = video_state.get("transcript_path") or video_state.get("transcription_path", "")
 
-    # Insert each clip into the queue as 'review'
-    for i, clip_path in enumerate(exported_paths):
-        caption = captions.get(i, f"Clip {i + 1}")
-        clip_meta = clips_data[i] if i < len(clips_data) else {}
-        metadata = {
-            "duration": clip_meta.get("duration", 0),
-            "start_time": clip_meta.get("start_time", 0),
-            "end_time": clip_meta.get("end_time", 0),
-            "clip_index": i,
-            "total_clips": len(exported_paths),
-        }
+        if not exported_paths:
+            # Try to find clips in the exports dir
+            exports_dir = Path(clips_dir)
+            exported_paths = sorted(str(p) for p in exports_dir.glob(f"*{video_id}*.mp4"))
 
-        clip_id = add_clip_to_queue(db_path, item_id, clip_path, caption, metadata, platforms)
-        logger.info(f"  Added clip #{clip_id} to review queue: {Path(clip_path).name}")
+        if not exported_paths:
+            update_queue_status(db_url, item_id, "failed", error="No clips exported")
+            return
 
-    # Mark source as done (change from 'processing' to something that indicates completion)
-    update_queue_status(db_path, item_id, "clipped")
-    logger.info(f"Finished #{item_id}: {len(exported_paths)} clips added to review queue")
+        # Generate captions (GENERATE_CAPTIONS step)
+        captions = {}
+        logger.info(f"[{JobStep.GENERATE_CAPTIONS.value}] Generating captions for {len(exported_paths)} clip(s)")
+        if transcript_path and os.path.exists(transcript_path):
+            try:
+                captions = generate_captions_for_clips(clips_data, transcript_path)
+            except Exception as e:
+                logger.error(f"Caption generation failed for #{item_id}: {e} — using fallback labels")
+        else:
+            logger.warning(f"No transcript found for #{item_id}, clips will have auto-labelled captions")
+
+        # Insert each clip into the queue as 'review'
+        for i, clip_path in enumerate(exported_paths):
+            caption = captions.get(i, f"Clip {i + 1}")
+            clip_meta = clips_data[i] if i < len(clips_data) else {}
+            metadata = {
+                "duration": clip_meta.get("duration", 0),
+                "start_time": clip_meta.get("start_time", 0),
+                "end_time": clip_meta.get("end_time", 0),
+                "clip_index": i,
+                "total_clips": len(exported_paths),
+            }
+
+            clip_id = add_clip_to_queue(db_url, item_id, clip_path, caption, metadata, platforms)
+            logger.info(f"  Added clip #{clip_id} to review queue: {Path(clip_path).name}")
+
+        # Mark source as done (change from 'processing' to something that indicates completion)
+        update_queue_status(db_url, item_id, "clipped")
+        logger.info(f"Finished #{item_id}: {len(exported_paths)} clips added to review queue")
 
 
-def run_once(db_path: str, clips_dir: str) -> int:
+def run_once(db_url: str, clips_dir: str) -> int:
     """Process all pending jobs. Returns number processed."""
-    jobs = get_processing_jobs(db_path)
+    jobs = get_processing_jobs(db_url)
     if not jobs:
         return 0
 
     logger.info(f"Found {len(jobs)} processing job(s)")
     for job in jobs:
         try:
-            process_job(db_path, job, clips_dir)
+            process_job(db_url, job, clips_dir)
         except Exception as exc:
             item_id = job.get("id")
             logger.error(f"Unhandled error processing job #{item_id}: {exc}")
             if item_id:
                 try:
-                    update_queue_status(db_path, item_id, "failed", error=f"Unhandled error: {exc}")
+                    update_queue_status(db_url, item_id, "failed", error=f"Unhandled error: {exc}")
                 except Exception:
                     pass
 
@@ -300,27 +364,28 @@ def run_once(db_path: str, clips_dir: str) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="CliperAi queue watcher")
-    parser.add_argument("--queue-db", required=True, help="Path to shorts-analytics queue.db")
+    parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""),
+                        help="PostgreSQL connection URL (or set DATABASE_URL env var)")
     parser.add_argument("--clips-dir", default=DEFAULT_CLIPS_DIR, help="Output directory for clips")
     parser.add_argument("--watch", type=int, metavar="SECONDS", help="Poll interval in seconds")
     args = parser.parse_args()
 
-    db_path = os.path.abspath(args.queue_db)
+    db_url = args.database_url
+    if not db_url:
+        logger.error("No database URL. Set --database-url or DATABASE_URL env var.")
+        sys.exit(1)
+
     clips_dir = os.path.abspath(args.clips_dir)
     os.makedirs(clips_dir, exist_ok=True)
 
-    if not os.path.exists(db_path):
-        logger.error(f"Queue DB not found: {db_path}")
-        sys.exit(1)
-
-    logger.info(f"Queue DB: {db_path}")
+    logger.info(f"Database: {db_url.split('@')[-1] if '@' in db_url else '(configured)'}")
     logger.info(f"Clips dir: {clips_dir}")
 
     if args.watch:
         logger.info(f"Watching every {args.watch}s (idle timeout: {IDLE_TIMEOUT_SECONDS}s)")
         last_activity = time.time()
         while True:
-            processed = run_once(db_path, clips_dir)
+            processed = run_once(db_url, clips_dir)
             if processed > 0:
                 last_activity = time.time()
             elif time.time() - last_activity > IDLE_TIMEOUT_SECONDS:
@@ -328,7 +393,7 @@ def main():
                 break
             time.sleep(args.watch)
     else:
-        run_once(db_path, clips_dir)
+        run_once(db_url, clips_dir)
 
 
 if __name__ == "__main__":

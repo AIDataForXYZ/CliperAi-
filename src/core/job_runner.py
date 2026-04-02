@@ -620,7 +620,8 @@ class JobRunner:
         self.state_manager.set_auto_generated_name(video_id, video_name)
         self.emit(LogEvent(job_id=job_id, video_id=video_id, level=LogLevel.INFO, message=f"Auto-generated video name: {video_name}"))
 
-        # SRT goes to cache dir
+        # SRT generation — needed for subtitles and speech-aware trim
+        add_subtitles = bool(shorts_settings.get("add_subtitles", True))
         temp_dir = Path(shorts_settings.get("temp_dir") or (video_run_dir / "shorts" / "temp"))
         temp_dir.mkdir(parents=True, exist_ok=True)
         srt_path = temp_dir / f"{video_id}.srt"
@@ -628,6 +629,8 @@ class JobRunner:
         # Get subtitle formatting settings from app settings
         subtitle_max_chars_per_line = int(shorts_settings.get("max_chars_per_line", app_settings.get("subtitle_max_chars_per_line", 42)))
         subtitle_max_duration = float(shorts_settings.get("max_duration", app_settings.get("subtitle_max_duration", 5.0)))
+
+        # Always generate SRT (used for speech-aware trimming even without burn-in)
         srt_generated = SubtitleGenerator().generate_srt_from_transcript(
             transcript_path=str(transcript_path),
             output_path=str(srt_path),
@@ -652,7 +655,7 @@ class JobRunner:
             video_path=input_path,
             video_name=video_name,
             output_filename=output_filename,
-            srt_path=str(srt_path),
+            srt_path=str(srt_path) if add_subtitles else None,
             transcript_path=str(transcript_path),
             subtitle_style=str(shorts_settings.get("subtitle_style") or effective_style),
             custom_style=custom_style,

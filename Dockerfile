@@ -17,14 +17,12 @@ RUN apt-get update && \
     libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy pyproject.toml first
-COPY pyproject.toml ./
+# Copy dependency files first (layer cache)
+COPY pyproject.toml uv.lock ./
 
 # Install Python dependencies using uv
-# uv is recommended for its speed and lock file management
-# Run uv sync inside the container to generate uv.lock and install dependencies
-RUN pip install uv && \
-    uv sync
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy the rest of your application code
 COPY . .
@@ -34,4 +32,5 @@ COPY . .
 
 # Define the command to run your application
 # This will be the default command when the container starts
-CMD ["uv", "run", "python", "src/tui/app.py"]
+ENV PATH="/app/.venv/bin:$PATH"
+CMD ["python", "src/tui/app.py"]
