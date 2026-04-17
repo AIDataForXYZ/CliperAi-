@@ -134,6 +134,7 @@ class VideoExporter:
         subtitle_max_duration: float = 5.0,
         # Output structure
         flat_output: bool = False,
+        fonts_dir: Optional[str] = None,
     ) -> List[str]:
         """
         Exporto todos los clips de un video
@@ -234,6 +235,7 @@ class VideoExporter:
                     ffmpeg_threads=ffmpeg_threads,
                     subtitle_max_chars_per_line=subtitle_max_chars_per_line,
                     subtitle_max_duration=subtitle_max_duration,
+                    fonts_dir=fonts_dir,
                 )
 
                 if clip_path:
@@ -264,6 +266,7 @@ class VideoExporter:
         grouping_preset: str = "smart",
         pause_threshold: Optional[float] = None,
         flat_output: bool = False,
+        fonts_dir: Optional[str] = None,
         # Speech-aware trimming: maximum silence buffer at start/end (milliseconds)
         trim_ms_start: int = 0,
         trim_ms_end: int = 0,
@@ -415,7 +418,7 @@ class VideoExporter:
                 if result1.returncode != 0:
                     raise RuntimeError(f"Error exporting short (step 1): {result1.stderr}")
 
-                subtitle_filter = self._get_subtitle_filter(str(srt_file), subtitle_style, custom_style)
+                subtitle_filter = self._get_subtitle_filter(str(srt_file), subtitle_style, custom_style, fonts_dir=fonts_dir)
                 cmd2 = [
                     "ffmpeg",
                     "-i",
@@ -467,7 +470,7 @@ class VideoExporter:
                     logo_out,
                 ])
             elif has_subtitles:
-                subtitle_filter = self._get_subtitle_filter(str(srt_file), subtitle_style, custom_style)
+                subtitle_filter = self._get_subtitle_filter(str(srt_file), subtitle_style, custom_style, fonts_dir=fonts_dir)
                 cmd.extend(["-i", str(video_path_p)])
                 cmd.extend(duration_args)
                 cmd.extend(["-vf", subtitle_filter, "-map", "0:v"])
@@ -545,6 +548,7 @@ class VideoExporter:
         # Subtitle formatting
         subtitle_max_chars_per_line: int = 42,
         subtitle_max_duration: float = 5.0,
+        fonts_dir: Optional[str] = None,
     ) -> Optional[Path]:
         clip_id = clip["clip_id"]
         start_time = float(clip["start_time"])
@@ -664,7 +668,7 @@ class VideoExporter:
 
             # If we are NOT doing two steps, add subtitles here
             if not needs_two_steps and add_subtitles and subtitle_file and subtitle_file.exists():
-                subtitle_filter = self._get_subtitle_filter(str(subtitle_file), subtitle_style, custom_style)
+                subtitle_filter = self._get_subtitle_filter(str(subtitle_file), subtitle_style, custom_style, fonts_dir=fonts_dir)
                 simple_filters.append(subtitle_filter)
 
             cmd = ["ffmpeg"] + inputs
@@ -727,7 +731,7 @@ class VideoExporter:
             # --- STEP 2: Add subtitles if required in a separate, safe step ---
             if needs_two_steps:
                 logger.info("Applying subtitles in a second step to avoid duplication bug.")
-                subtitle_filter = self._get_subtitle_filter(str(subtitle_file), subtitle_style, custom_style)
+                subtitle_filter = self._get_subtitle_filter(str(subtitle_file), subtitle_style, custom_style, fonts_dir=fonts_dir)
                 cmd2 = [
                     "ffmpeg",
                     "-i",
@@ -847,6 +851,7 @@ class VideoExporter:
         subtitle_path: str,
         style: str = "default",
         custom_style: Optional[Dict[str, str]] = None,
+        fonts_dir: Optional[str] = None,
     ) -> str:
         """
         Genero el filtro de ffmpeg para quemar subtítulos en el video
@@ -934,7 +939,11 @@ class VideoExporter:
         # Construyo el filtro subtitles con el estilo
         # subtitles filter quema los subtítulos directamente en el video
         # Wrapeamos el path con comillas simples para manejar espacios
-        subtitle_filter = f"subtitles='{subtitle_path_escaped}':force_style='"
+        if fonts_dir:
+            fonts_dir_escaped = self._escape_ffmpeg_filter_path(fonts_dir)
+            subtitle_filter = f"subtitles='{subtitle_path_escaped}':fontsdir='{fonts_dir_escaped}':force_style='"
+        else:
+            subtitle_filter = f"subtitles='{subtitle_path_escaped}':force_style='"
         subtitle_filter += f"FontName={selected_style['FontName']},"
         subtitle_filter += f"FontSize={selected_style['FontSize']},"
         subtitle_filter += f"PrimaryColour={selected_style['PrimaryColour']},"
